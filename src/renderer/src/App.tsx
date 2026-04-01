@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import type { Settings, WindowInfo } from './env'
+import type { Settings, AppInfo } from './env'
 
 const FREQUENCIES = ['1 hour', '2 hours', '4 hours', '6 hours', 'End of day']
 
@@ -11,15 +11,14 @@ export default function App() {
     frequency: 'End of day',
     checkBeforeUpdating: true,
     aiProvider: 'claude',
-    windowSelected: false,
-    selectedWindowId: null,
-    selectedWindowTitle: null,
+    whitelistedApps: [],
     lastUpdated: null,
   })
   const [hovered, setHovered] = useState<string | null>(null)
   const [frequencyOpen, setFrequencyOpen] = useState(false)
-  const [view, setView] = useState<'menu' | 'picker' | 'draft'>('menu')
-  const [windows, setWindows] = useState<WindowInfo[]>([])
+  const [view, setView] = useState<'menu' | 'whitelist' | 'draft'>('menu')
+  const [runningApps, setRunningApps] = useState<AppInfo[]>([])
+  const [selectedApps, setSelectedApps] = useState<string[]>([])
   const [draft, setDraft] = useState<string>('')
   const [loading, setLoading] = useState(false)
   const panelRef = useRef<HTMLDivElement>(null)
@@ -28,14 +27,19 @@ export default function App() {
     window.relay.getSettings().then(setSettings)
   }, [])
 
-  // Listen for Notion OAuth callback from main process
   useEffect(() => {
     window.relay.onNotionConnected(() => {
       window.relay.getSettings().then(setSettings)
     })
   }, [])
 
-  // Resize the window to match content height
+  useEffect(() => {
+    window.relay.onSnapshotReady((newDraft) => {
+      setDraft(newDraft)
+      setView('draft')
+    })
+  }, [])
+
   useEffect(() => {
     if (!panelRef.current) return
     const observer = new ResizeObserver(() => {
@@ -53,21 +57,23 @@ export default function App() {
     window.relay.saveSettings(updated)
   }
 
-  async function openPicker() {
-    const list = await window.relay.listWindows()
-    setWindows(list)
-    setView('picker')
+  async function openWhitelist() {
+    const apps = await window.relay.listApps()
+    setRunningApps(apps)
+    setSelectedApps(settings.whitelistedApps)
+    setView('whitelist')
   }
 
-  async function pickWindow(w: WindowInfo) {
-    await window.relay.selectWindow(w)
-    setSettings((s) => ({
-      ...s,
-      windowSelected: true,
-      selectedWindowId: w.id,
-      selectedWindowTitle: w.name,
-    }))
+  async function saveWhitelist() {
+    await window.relay.setWhitelist(selectedApps)
+    setSettings((s) => ({ ...s, whitelistedApps: selectedApps }))
     setView('menu')
+  }
+
+  function toggleApp(appName: string) {
+    setSelectedApps((prev) =>
+      prev.includes(appName) ? prev.filter((a) => a !== appName) : [...prev, appName]
+    )
   }
 
   function row(id: string, label: string, shortcut: string, onClick?: () => void) {
@@ -99,7 +105,7 @@ export default function App() {
     )
   }
 
-  // ── Window picker view ──────────────────────────────────────────────────────
+  // ── Draft view ──────────────────────────────────────────────────────────────
 
   if (view === 'draft') {
     return (
@@ -110,30 +116,55 @@ export default function App() {
           <p className="draft-label">Progress update draft</p>
           <p className="draft-text">{draft}</p>
         </div>
+        <div className="divider" />
+        <div
+          className={`row${hovered === 'send' ? ' hovered' : ''}`}
+          onMouseEnter={() => setHovered('send')}
+          onMouseLeave={() => setHovered(null)}
+          onClick={async () => {
+            // Hardcoded to "Write a PRD for post-MVP" card for now
+            const result = await window.relay.writeToNotion('33479582-581e-80a9-b4f1-c281d2ff5adb', draft)
+            if (result.status === 'ok') setView('menu')
+          }}
+        >
+          <span className="label">→ Send to Notion</span>
+        </div>
       </div>
     )
   }
 
-  if (view === 'picker') {
+  // ── Whitelist picker view ───────────────────────────────────────────────────
+
+  if (view === 'whitelist') {
     return (
       <div className="panel" ref={panelRef}>
         {row('back', '← Back', '', () => setView('menu'))}
         <div className="divider" />
         <div className="picker-list">
-          {windows.length === 0 && (
-            <div className="picker-empty">No windows found</div>
+          {runningApps.length === 0 && (
+            <div className="picker-empty">No apps found</div>
           )}
-          {windows.map((w, i) => (
+          {runningApps.map((a) => (
             <div
-              key={i}
-              className={`picker-row${hovered === `w-${i}` ? ' hovered' : ''}`}
-              onMouseEnter={() => setHovered(`w-${i}`)}
+              key={a.app}
+              className={`picker-row${hovered === a.app ? ' hovered' : ''}`}
+              onMouseEnter={() => setHovered(a.app)}
               onMouseLeave={() => setHovered(null)}
-              onClick={() => pickWindow(w)}
+              onClick={() => toggleApp(a.app)}
             >
-              <span className="picker-title">{w.name}</span>
+              <span className="picker-check">{selectedApps.includes(a.app) ? '✓' : ''}</span>
+              <span className="picker-title">{a.app}</span>
             </div>
           ))}
+        </div>
+        <div className="divider" />
+        <div
+          className={`row${hovered === 'save-whitelist' ? ' hovered' : ''}`}
+          onMouseEnter={() => setHovered('save-whitelist')}
+          onMouseLeave={() => setHovered(null)}
+          onClick={saveWhitelist}
+        >
+          <span className="label">Save ({selectedApps.length} apps)</span>
         </div>
       </div>
     )
@@ -143,26 +174,24 @@ export default function App() {
 
   return (
     <div className="panel" ref={panelRef}>
-      {/* Select Window */}
-      {row('select', 'Select window', '⌘Z', openPicker)}
-      {settings.windowSelected &&
-        subRow('window-status', settings.selectedWindowTitle ?? 'Window selected', '')}
+      {/* Monitored Apps */}
+      {row('whitelist', 'Monitor apps', '⌘Z', openWhitelist)}
+      {settings.whitelistedApps.length > 0 &&
+        subRow('whitelist-status', `${settings.whitelistedApps.length} app${settings.whitelistedApps.length > 1 ? 's' : ''} monitored`, '')}
 
       <div className="divider" />
 
       {/* Latest Summary */}
-      {row('summary', 'Check the latest summary', '⌘V')}
+      {draft
+        ? row('summary', 'Check the latest summary', '⌘V', () => setView('draft'))
+        : subRow('summary-empty', 'No summary yet', '')}
 
       <div className="divider" />
 
       {/* Notion */}
       {row('notion', 'Connect to Notion', '⌥⌘V', () => window.relay.connectNotion())}
-      {settings.notionConnected && (
-        <>
-          {subRow('notion-status', 'Status: connected', '✓')}
-          {subRow('board', 'Change board', '⌘A', () => console.log('change board'))}
-        </>
-      )}
+      {settings.notionConnected &&
+        subRow('notion-status', 'Status: connected', '✓')}
 
       <div className="divider" />
 

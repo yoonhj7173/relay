@@ -5,16 +5,13 @@ export type Settings = {
   frequency: string
   checkBeforeUpdating: boolean
   aiProvider: 'claude' | 'ollama'
-  windowSelected: boolean
-  selectedWindowId: string | null
-  selectedWindowTitle: string | null
+  whitelistedApps: string[]
   lastUpdated: string | null
 }
 
-export type WindowInfo = {
-  id: string
-  name: string
-  thumbnail: string
+export type AppInfo = {
+  pid: number
+  app: string
 }
 
 declare global {
@@ -23,10 +20,12 @@ declare global {
       getSettings: () => Promise<Settings>
       saveSettings: (settings: Settings) => Promise<{ success: boolean }>
       connectNotion: () => Promise<{ status: string }>
-      listWindows: () => Promise<WindowInfo[]>
-      selectWindow: (window: WindowInfo) => Promise<{ status: string }>
+      writeToNotion: (pageId: string, draft: string) => Promise<{ status: string }>
+      listApps: () => Promise<AppInfo[]>
+      setWhitelist: (apps: string[]) => Promise<{ status: string }>
       triggerSnapshot: () => Promise<{ status: string; draft?: string }>
       onNotionConnected: (callback: () => void) => void
+      onSnapshotReady: (callback: (draft: string) => void) => void
       setHeight: (height: number) => void
       quit: () => void
     }

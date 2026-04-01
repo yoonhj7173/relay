@@ -9,7 +9,9 @@
       "Bash(sips -z 18 18 /Users/apple/Desktop/HY/projects/relay/logos/relay-logo-monochrome.png --out /Users/apple/Desktop/HY/projects/relay/resources/iconTemplate.png)",
       "Bash(python3 -c \"from PIL import Image; print\\(''''pillow ok''''\\)\")",
       "Bash(convert --version)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(source /Users/apple/Desktop/HY/projects/relay/.env)",
+      "Bash(curl -s \"https://api.notion.com/v1/databases/33279582581e80c692d9d00eab43031c\" -H \"Authorization: Bearer $MAIN_VITE_NOTION_CLIENT_SECRET\" -H \"Notion-Version: 2022-06-28\")"
     ]
   }
 }

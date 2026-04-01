@@ -1,6 +1,6 @@
-import { app, BrowserWindow, Tray, nativeImage, ipcMain, screen, shell, desktopCapturer } from 'electron'
+import { app, BrowserWindow, Tray, nativeImage, ipcMain, screen, shell, Notification } from 'electron'
 import { join } from 'path'
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from 'fs'
 import { createServer } from 'http'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
@@ -10,6 +10,15 @@ const execFileAsync = promisify(execFile)
 
 let tray: Tray | null = null
 let win: BrowserWindow | null = null
+let snapshotTimer: ReturnType<typeof setInterval> | null = null
+
+const FREQUENCY_MS: Record<string, number> = {
+  '1 hour':    1 * 60 * 60 * 1000,
+  '2 hours':   2 * 60 * 60 * 1000,
+  '4 hours':   4 * 60 * 60 * 1000,
+  '6 hours':   6 * 60 * 60 * 1000,
+  'End of day': 8 * 60 * 60 * 1000,
+}
 
 // ── Settings persistence ──────────────────────────────────────────────────────
 
@@ -22,9 +31,7 @@ const DEFAULT_SETTINGS = {
   frequency: 'End of day',
   checkBeforeUpdating: true,
   aiProvider: 'claude' as 'claude' | 'ollama',
-  windowSelected: false,
-  selectedWindowId: null as string | null,
-  selectedWindowTitle: null as string | null,
+  whitelistedApps: [] as string[],           // app names user wants to monitor
   anthropicKey: import.meta.env.MAIN_VITE_ANTHROPIC_KEY as string,
   lastUpdated: null as string | null,
 }
@@ -49,6 +56,58 @@ function persistSettings(settings: Settings): void {
     writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2))
   } catch (e) {
     console.error('Failed to save settings:', e)
+  }
+}
+
+// ── Snapshot persistence ──────────────────────────────────────────────────────
+
+const SNAPSHOT_PATH = join(app.getPath('userData'), 'last-snapshot.txt')
+
+function loadLastSnapshot(): string {
+  try {
+    if (existsSync(SNAPSHOT_PATH)) return readFileSync(SNAPSHOT_PATH, 'utf-8')
+  } catch { /* ignore */ }
+  return ''
+}
+
+function saveSnapshot(text: string): void {
+  writeFileSync(SNAPSHOT_PATH, text, 'utf-8')
+}
+
+function clearSnapshot(): void {
+  try { if (existsSync(SNAPSHOT_PATH)) unlinkSync(SNAPSHOT_PATH) } catch { /* ignore */ }
+}
+
+// ── Scheduler ─────────────────────────────────────────────────────────────────
+
+function startScheduler(frequencyMs: number): void {
+  if (snapshotTimer) clearInterval(snapshotTimer)
+  snapshotTimer = setInterval(async () => {
+    const settings = loadSettings()
+    if (settings.whitelistedApps.length === 0) return
+    try {
+      const text = await readWhitelistedApps(settings.whitelistedApps)
+      if (!text) return
+      const previous = loadLastSnapshot()
+      const draft = await generateDraft(text, previous, settings.anthropicKey)
+      saveSnapshot(text)
+      // Notify the renderer so it can show the draft
+      win?.webContents.send('snapshot:ready', draft)
+      // Show a system notification
+      new Notification({
+        title: 'Relay',
+        body: 'Progress update ready — click to review',
+      }).show()
+    } catch (e) {
+      console.error('Scheduled snapshot failed:', e)
+    }
+  }, frequencyMs)
+}
+
+function stopScheduler(): void {
+  if (snapshotTimer) {
+    clearInterval(snapshotTimer)
+    snapshotTimer = null
   }
 }
 
@@ -89,12 +148,9 @@ function startOAuthServer(): Promise<string> {
   return new Promise((resolve, reject) => {
     const server = createServer((req, res) => {
       const code = new URL(req.url!, 'http://localhost:3476').searchParams.get('code')
-
       res.writeHead(200, { 'Content-Type': 'text/html' })
       res.end('<html><body><p>Connected to Notion. You can close this tab.</p></body></html>')
-
       server.close()
-
       if (code) resolve(code)
       else reject(new Error('No code in callback'))
     })
@@ -113,9 +169,50 @@ function startOAuthServer(): Promise<string> {
   })
 }
 
+// ── Notion write ──────────────────────────────────────────────────────────────
+
+async function appendToNotionCard(pageId: string, draft: string, token: string): Promise<void> {
+  const date = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+  const lines = draft.split('\n').map((l) => l.replace(/^[-•]\s*/, '').trim()).filter(Boolean)
+
+  const children = [
+    {
+      type: 'heading_3',
+      heading_3: {
+        rich_text: [{ type: 'text', text: { content: `Progress Update – ${date}` } }],
+      },
+    },
+    ...lines.map((line) => ({
+      type: 'bulleted_list_item',
+      bulleted_list_item: {
+        rich_text: [{ type: 'text', text: { content: line } }],
+      },
+    })),
+  ]
+
+  const res = await fetch(`https://api.notion.com/v1/blocks/${pageId}/children`, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Notion-Version': '2022-06-28',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ children }),
+  })
+
+  if (!res.ok) {
+    const err = (await res.json()) as { message: string }
+    throw new Error(err.message)
+  }
+}
+
 // ── AI ────────────────────────────────────────────────────────────────────────
 
-async function generateDraft(text: string, apiKey: string): Promise<string> {
+async function generateDraft(text: string, previous: string, apiKey: string): Promise<string> {
+  const diffSection = previous
+    ? `Previous snapshot (what was there before):\n${previous.slice(0, 4000)}\n\nCurrent snapshot (what's there now):\n${text.slice(0, 4000)}`
+    : `Current snapshot:\n${text.slice(0, 8000)}`
+
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -131,10 +228,9 @@ async function generateDraft(text: string, apiKey: string): Promise<string> {
           role: 'user',
           content: `You are helping a team member write a progress update for their team board.
 
-Based on the following content captured from their work window, write a concise progress update in 2-3 bullet points. Focus on what has been done or is currently in progress. Be specific and factual — only use what's in the content below.
+Based on the following content captured from their work apps, write a concise progress update in 2-3 bullet points. Focus on what has changed or is currently in progress. Be specific and factual — only use what's in the content below.
 
-Content:
-${text.slice(0, 8000)}
+${diffSection}
 
 Write only the bullet points, nothing else.`,
         },
@@ -153,17 +249,43 @@ Write only the bullet points, nothing else.`,
 
 // ── Swift helpers ─────────────────────────────────────────────────────────────
 
-// In dev, resources/ is relative to project root. In production, it's bundled.
 const resourcesPath = is.dev
   ? join(__dirname, '../../resources')
   : process.resourcesPath
 
-type WindowInfo = { id: string; name: string; thumbnail: string }
+type AppInfo = { pid: number; app: string }
 
-async function readWindowText(sourceId: string): Promise<string> {
+// Returns all running apps (deduplicated by name)
+async function listRunningApps(): Promise<AppInfo[]> {
+  const bin = join(resourcesPath, 'list-windows')
+  const { stdout } = await execFileAsync(bin)
+  return JSON.parse(stdout) as AppInfo[]
+}
+
+// Reads all text from a specific app via Accessibility API
+async function readAppText(pid: number): Promise<string> {
   const bin = join(resourcesPath, 'read-window')
-  const { stdout } = await execFileAsync(bin, [sourceId])
+  const { stdout } = await execFileAsync(bin, [String(pid)])
   return stdout.trim()
+}
+
+// Reads text from all currently open whitelisted apps, concatenates
+async function readWhitelistedApps(whitelistedApps: string[]): Promise<string> {
+  if (whitelistedApps.length === 0) return ''
+
+  const running = await listRunningApps()
+  const targets = running.filter((a) => whitelistedApps.includes(a.app))
+
+  if (targets.length === 0) return ''
+
+  const results = await Promise.all(
+    targets.map(async (a) => {
+      const text = await readAppText(a.pid)
+      return text ? `[${a.app}]\n${text}` : ''
+    })
+  )
+
+  return results.filter(Boolean).join('\n\n')
 }
 
 // ── Window ────────────────────────────────────────────────────────────────────
@@ -205,7 +327,6 @@ function positionWindow(): void {
   const y = trayBounds.y + trayBounds.height + 4
 
   x = Math.max(workArea.x + 8, Math.min(x, workArea.x + workArea.width - winWidth - 8))
-
   win.setPosition(x, y, false)
 }
 
@@ -255,6 +376,11 @@ ipcMain.handle('settings:get', () => loadSettings())
 
 ipcMain.handle('settings:save', (_event, settings: Settings) => {
   persistSettings(settings)
+  // Restart scheduler if frequency changed and whitelist is set
+  if (settings.whitelistedApps.length > 0) {
+    const ms = FREQUENCY_MS[settings.frequency] ?? FREQUENCY_MS['End of day']
+    startScheduler(ms)
+  }
   return { success: true }
 })
 
@@ -269,45 +395,62 @@ ipcMain.handle('notion:connect', async () => {
   }
 })
 
-ipcMain.handle('window:list', async () => {
+ipcMain.handle('notion:write', async (_event, { pageId, draft }: { pageId: string; draft: string }) => {
+  const settings = loadSettings()
+  if (!settings.notionToken) return { status: 'not_connected' }
   try {
-    const sources = await desktopCapturer.getSources({
-      types: ['window'],
-      thumbnailSize: { width: 200, height: 140 },
-    })
-    return sources
-      .filter((s) => s.name && s.name.length > 0)
-      .map((s) => ({
-        id: s.id,
-        name: s.name,
-        thumbnail: s.thumbnail.toDataURL(),
-      }))
+    await appendToNotionCard(pageId, draft, settings.notionToken)
+    return { status: 'ok' }
   } catch (e) {
-    console.error('window:list failed:', e)
+    console.error('notion:write failed:', e)
+    return { status: 'error' }
+  }
+})
+
+// Start scheduler on app ready if whitelist already set
+app.whenReady().then(() => {
+  const settings = loadSettings()
+  if (settings.whitelistedApps.length > 0) {
+    const ms = FREQUENCY_MS[settings.frequency] ?? FREQUENCY_MS['End of day']
+    startScheduler(ms)
+  }
+})
+
+// Returns list of currently running apps for whitelist selection
+ipcMain.handle('apps:list', async () => {
+  try {
+    return await listRunningApps()
+  } catch (e) {
+    console.error('apps:list failed:', e)
     return []
   }
 })
 
-ipcMain.handle('window:select', async (_event, window: WindowInfo) => {
+// Saves the user's app whitelist and (re)starts the scheduler
+ipcMain.handle('apps:setWhitelist', async (_event, apps: string[]) => {
   const settings = loadSettings()
-  persistSettings({
-    ...settings,
-    windowSelected: true,
-    selectedWindowId: window.id,
-    selectedWindowTitle: window.name,
-  })
-  return { status: 'selected' }
+  persistSettings({ ...settings, whitelistedApps: apps })
+  if (apps.length > 0) {
+    const ms = FREQUENCY_MS[settings.frequency] ?? FREQUENCY_MS['End of day']
+    startScheduler(ms)
+  } else {
+    stopScheduler()
+  }
+  return { status: 'ok' }
 })
 
+// Reads all whitelisted apps → generates AI draft
 ipcMain.handle('snapshot:trigger', async () => {
   const settings = loadSettings()
-  if (!settings.windowSelected || !settings.selectedWindowId) {
-    return { status: 'no_window_selected' }
+  if (settings.whitelistedApps.length === 0) {
+    return { status: 'no_apps_selected' }
   }
   try {
-    const text = await readWindowText(settings.selectedWindowId)
+    const text = await readWhitelistedApps(settings.whitelistedApps)
     if (!text) return { status: 'empty' }
-    const draft = await generateDraft(text, settings.anthropicKey)
+    const previous = loadLastSnapshot()
+    const draft = await generateDraft(text, previous, settings.anthropicKey)
+    saveSnapshot(text)
     return { status: 'ok', draft }
   } catch (e) {
     console.error('snapshot failed:', e)

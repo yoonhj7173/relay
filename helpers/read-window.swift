@@ -1,32 +1,12 @@
 import Foundation
 import AppKit
-import CoreGraphics
 
-// Accepts a desktopCapturer source ID like "window:12345:0"
-// Extracts the CGWindowID, looks up the PID, then reads text via Accessibility API.
-guard CommandLine.arguments.count > 1 else {
-    fputs("Usage: read-window <source-id>\n", stderr)
+// Accepts a PID and reads all text from that app via Accessibility API.
+guard CommandLine.arguments.count > 1, let pid = pid_t(CommandLine.arguments[1]) else {
+    fputs("Usage: read-window <pid>\n", stderr)
     exit(1)
 }
 
-let sourceId = CommandLine.arguments[1]
-let parts = sourceId.split(separator: ":")
-
-guard parts.count >= 2, let windowNum = UInt32(parts[1]) else {
-    fputs("Invalid source ID: \(sourceId)\n", stderr)
-    exit(1)
-}
-
-let cgWindowId = CGWindowID(windowNum)
-
-// Look up PID from the CGWindowID
-let windowInfo = CGWindowListCopyWindowInfo([.optionIncludingWindow], cgWindowId) as? [[String: Any]]
-guard let pid = windowInfo?.first?[kCGWindowOwnerPID as String] as? pid_t else {
-    fputs("Could not find PID for window \(cgWindowId)\n", stderr)
-    exit(1)
-}
-
-// Walk the accessibility tree and collect all text
 let appElement = AXUIElementCreateApplication(pid)
 
 func extractText(_ element: AXUIElement, depth: Int = 0) -> [String] {

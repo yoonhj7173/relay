@@ -176,6 +176,18 @@ body {
   color: #fff;
 }
 
+.picker-check {
+  width: 16px;
+  font-size: 11px;
+  color: #0055d4;
+  flex-shrink: 0;
+  margin-right: 4px;
+}
+
+.picker-row.hovered .picker-check {
+  color: #fff;
+}
+
 .picker-empty {
   padding: 12px 14px;
   font-size: 13px;
