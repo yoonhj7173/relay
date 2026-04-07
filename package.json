@@ -8,7 +8,8 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
-    "build:mac": "npm run build && electron-builder --mac"
+    "build:mac:dev": "npm run build && electron-builder --mac --config.mac.identity=null",
+    "build:mac:dist": "npm run build && electron-builder --mac"
   },
   "dependencies": {
     "@electron-toolkit/utils": "^3.0.0"
@@ -30,9 +31,16 @@
   "build": {
     "appId": "com.relay.app",
     "productName": "Relay",
+    "extraResources": [
+      { "from": "resources/read-window", "to": "read-window" },
+      { "from": "resources/list-windows", "to": "list-windows" }
+    ],
     "mac": {
       "target": "dmg",
-      "category": "public.app-category.productivity"
+      "category": "public.app-category.productivity",
+      "notarize": {
+        "teamId": "${APPLE_TEAM_ID}"
+      }
     }
   }
 }

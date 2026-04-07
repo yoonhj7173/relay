@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Tray, nativeImage, ipcMain, screen, shell, Notification } from 'electron'
+import { app, BrowserWindow, Tray, nativeImage, ipcMain, screen, shell, Notification, systemPreferences } from 'electron'
 import { join } from 'path'
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from 'fs'
 import { createServer } from 'http'
@@ -32,6 +32,7 @@ const DEFAULT_SETTINGS = {
   checkBeforeUpdating: true,
   aiProvider: 'claude' as 'claude' | 'ollama',
   whitelistedApps: [] as string[],           // app names user wants to monitor
+  activeCards: [] as { id: string; title: string }[],
   anthropicKey: import.meta.env.MAIN_VITE_ANTHROPIC_KEY as string,
   lastUpdated: null as string | null,
 }
@@ -59,9 +60,29 @@ function persistSettings(settings: Settings): void {
   }
 }
 
+// ── Draft persistence ─────────────────────────────────────────────────────────
+
+const DRAFTS_PATH = join(app.getPath('userData'), 'last-drafts.json')
+
+function saveDrafts(drafts: DraftItem[]): void {
+  try { writeFileSync(DRAFTS_PATH, JSON.stringify(drafts), 'utf-8') } catch { /* ignore */ }
+}
+
+function loadDrafts(): DraftItem[] {
+  try {
+    if (existsSync(DRAFTS_PATH)) return JSON.parse(readFileSync(DRAFTS_PATH, 'utf-8')) as DraftItem[]
+  } catch { /* ignore */ }
+  return []
+}
+
+function clearDrafts(): void {
+  try { if (existsSync(DRAFTS_PATH)) unlinkSync(DRAFTS_PATH) } catch { /* ignore */ }
+}
+
 // ── Snapshot persistence ──────────────────────────────────────────────────────
 
-const SNAPSHOT_PATH = join(app.getPath('userData'), 'last-snapshot.txt')
+const SNAPSHOT_PATH      = join(app.getPath('userData'), 'last-snapshot.txt')
+const SNAPSHOT_TIME_PATH = join(app.getPath('userData'), 'last-snapshot-time.txt')
 
 function loadLastSnapshot(): string {
   try {
@@ -70,12 +91,32 @@ function loadLastSnapshot(): string {
   return ''
 }
 
+function loadLastSnapshotTime(): Date | null {
+  try {
+    if (existsSync(SNAPSHOT_TIME_PATH))
+      return new Date(readFileSync(SNAPSHOT_TIME_PATH, 'utf-8').trim())
+  } catch { /* ignore */ }
+  return null
+}
+
 function saveSnapshot(text: string): void {
   writeFileSync(SNAPSHOT_PATH, text, 'utf-8')
+  writeFileSync(SNAPSHOT_TIME_PATH, new Date().toISOString(), 'utf-8')
 }
 
 function clearSnapshot(): void {
   try { if (existsSync(SNAPSHOT_PATH)) unlinkSync(SNAPSHOT_PATH) } catch { /* ignore */ }
+  try { if (existsSync(SNAPSHOT_TIME_PATH)) unlinkSync(SNAPSHOT_TIME_PATH) } catch { /* ignore */ }
+}
+
+function formatTimePeriod(start: Date | null, end: Date): string {
+  const timeOpts: Intl.DateTimeFormatOptions = { hour: 'numeric', minute: '2-digit', hour12: true, timeZoneName: 'short' }
+  const dateOpts: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric', year: 'numeric' }
+  const endStr  = end.toLocaleTimeString('en-US', timeOpts)
+  const dateStr = end.toLocaleDateString('en-US', dateOpts)
+  if (!start) return `Progress Update – ${endStr}, ${dateStr}`
+  const startStr = start.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })
+  return `Progress Update – ${startStr} – ${endStr}, ${dateStr}`
 }
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────
@@ -84,16 +125,18 @@ function startScheduler(frequencyMs: number): void {
   if (snapshotTimer) clearInterval(snapshotTimer)
   snapshotTimer = setInterval(async () => {
     const settings = loadSettings()
-    if (settings.whitelistedApps.length === 0) return
+    if (settings.whitelistedApps.length === 0 || settings.activeCards.length === 0) return
     try {
-      const text = await readWhitelistedApps(settings.whitelistedApps)
+      const { text, unreadableApps } = await readWhitelistedApps(settings.whitelistedApps)
       if (!text) return
       const previous = loadLastSnapshot()
-      const draft = await generateDraft(text, previous, settings.anthropicKey)
+      const formatSample = settings.notionToken && settings.selectedBoard
+        ? await fetchFormatSample(settings.notionToken, settings.selectedBoard)
+        : ''
+      const drafts = await generateDrafts(text, previous, settings.activeCards, formatSample, settings.anthropicKey)
       saveSnapshot(text)
-      // Notify the renderer so it can show the draft
-      win?.webContents.send('snapshot:ready', draft)
-      // Show a system notification
+      saveDrafts(drafts)
+      win?.webContents.send('snapshot:ready', { drafts, unreadableApps })
       new Notification({
         title: 'Relay',
         body: 'Progress update ready — click to review',
@@ -172,14 +215,15 @@ function startOAuthServer(): Promise<string> {
 // ── Notion write ──────────────────────────────────────────────────────────────
 
 async function appendToNotionCard(pageId: string, draft: string, token: string): Promise<void> {
-  const date = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+  const start = loadLastSnapshotTime()
+  const title = formatTimePeriod(start, new Date())
   const lines = draft.split('\n').map((l) => l.replace(/^[-•]\s*/, '').trim()).filter(Boolean)
 
   const children = [
     {
       type: 'heading_3',
       heading_3: {
-        rich_text: [{ type: 'text', text: { content: `Progress Update – ${date}` } }],
+        rich_text: [{ type: 'text', text: { content: title } }],
       },
     },
     ...lines.map((line) => ({
@@ -208,10 +252,60 @@ async function appendToNotionCard(pageId: string, draft: string, token: string):
 
 // ── AI ────────────────────────────────────────────────────────────────────────
 
-async function generateDraft(text: string, previous: string, apiKey: string): Promise<string> {
+type DraftItem = { cardId: string; cardTitle: string; text: string }
+
+async function fetchFormatSample(token: string, databaseId: string): Promise<string> {
+  try {
+    const queryRes = await fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Notion-Version': '2022-06-28',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ page_size: 2, sorts: [{ timestamp: 'last_edited_time', direction: 'descending' }] }),
+    })
+    const queryData = (await queryRes.json()) as { results: Array<{ id: string }> }
+
+    const samples: string[] = []
+    for (const page of queryData.results) {
+      const blocksRes = await fetch(`https://api.notion.com/v1/blocks/${page.id}/children`, {
+        headers: { Authorization: `Bearer ${token}`, 'Notion-Version': '2022-06-28' },
+      })
+      const blocksData = (await blocksRes.json()) as {
+        results: Array<{ type: string } & Record<string, unknown>>
+      }
+      const text = blocksData.results
+        .map((b) => {
+          const content = b[b.type] as { rich_text?: Array<{ plain_text: string }> } | undefined
+          return content?.rich_text?.map((t) => t.plain_text).join('') ?? ''
+        })
+        .filter(Boolean)
+        .join('\n')
+      if (text) samples.push(text)
+    }
+    return samples.join('\n\n---\n\n')
+  } catch {
+    return ''
+  }
+}
+
+async function generateDrafts(
+  text: string,
+  previous: string,
+  activeCards: { id: string; title: string }[],
+  formatSample: string,
+  apiKey: string,
+): Promise<DraftItem[]> {
   const diffSection = previous
-    ? `Previous snapshot (what was there before):\n${previous.slice(0, 4000)}\n\nCurrent snapshot (what's there now):\n${text.slice(0, 4000)}`
-    : `Current snapshot:\n${text.slice(0, 8000)}`
+    ? `Previous snapshot (what was there before):\n${previous.slice(0, 3000)}\n\nCurrent snapshot (what's there now):\n${text.slice(0, 3000)}`
+    : `Current snapshot:\n${text.slice(0, 6000)}`
+
+  const formatSection = formatSample
+    ? `Format reference — this is how the team writes updates (follow this style and structure):\n${formatSample.slice(0, 1500)}\n\n`
+    : ''
+
+  const cardList = activeCards.map((c, i) => `${i + 1}. "${c.title}" (id: ${c.id})`).join('\n')
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -222,17 +316,27 @@ async function generateDraft(text: string, previous: string, apiKey: string): Pr
     },
     body: JSON.stringify({
       model: 'claude-sonnet-4-6',
-      max_tokens: 512,
+      max_tokens: 2048,
       messages: [
         {
           role: 'user',
-          content: `You are helping a team member write a progress update for their team board.
+          content: `You are helping a team member write progress updates for their team board.
 
-Based on the following content captured from their work apps, write a concise progress update in 2-3 bullet points. Focus on what has changed or is currently in progress. Be specific and factual — only use what's in the content below.
+${formatSection}Active cards today:
+${cardList}
 
-${diffSection}
+Based on the app content below, write a progress update for each card that has relevant activity. If a card has no relevant activity, omit it from the response.
 
-Write only the bullet points, nothing else.`,
+Rules:
+1. LENGTH: Let actual activity determine length. Short if little happened, longer if a lot did.
+2. STRUCTURE: Bullet points for what was done. Only add "Next steps", "Action items", "ETA", or "Recommendations" sections if the content clearly supports them.
+3. Be specific and factual — only use what's in the content. No fabrication.
+4. Match the format and style of the format reference if provided.
+
+Respond with a JSON array only — no markdown, no explanation:
+[{"cardId": "...", "draft": "..."}]
+
+${diffSection}`,
         },
       ],
     }),
@@ -244,7 +348,24 @@ Write only the bullet points, nothing else.`,
   }
 
   if (data.error) throw new Error(data.error.message)
-  return data.content[0].text
+
+  const raw = data.content[0].text
+  const start = raw.indexOf('[')
+  if (start === -1) throw new Error('No JSON array in Claude response')
+  let depth = 0
+  let end = -1
+  for (let i = start; i < raw.length; i++) {
+    if (raw[i] === '[') depth++
+    else if (raw[i] === ']') { depth--; if (depth === 0) { end = i; break } }
+  }
+  if (end === -1) throw new Error('Unclosed JSON array in Claude response')
+  const parsed = JSON.parse(raw.slice(start, end + 1)) as Array<{ cardId: string; draft: string }>
+
+  return parsed.map((item) => ({
+    cardId: item.cardId,
+    cardTitle: activeCards.find((c) => c.id === item.cardId)?.title ?? 'Unknown',
+    text: item.draft,
+  }))
 }
 
 // ── Swift helpers ─────────────────────────────────────────────────────────────
@@ -270,22 +391,28 @@ async function readAppText(pid: number): Promise<string> {
 }
 
 // Reads text from all currently open whitelisted apps, concatenates
-async function readWhitelistedApps(whitelistedApps: string[]): Promise<string> {
-  if (whitelistedApps.length === 0) return ''
+async function readWhitelistedApps(whitelistedApps: string[]): Promise<{ text: string; unreadableApps: string[] }> {
+  if (whitelistedApps.length === 0) return { text: '', unreadableApps: [] }
 
   const running = await listRunningApps()
   const targets = running.filter((a) => whitelistedApps.includes(a.app))
 
-  if (targets.length === 0) return ''
+  if (targets.length === 0) return { text: '', unreadableApps: [] }
 
   const results = await Promise.all(
     targets.map(async (a) => {
       const text = await readAppText(a.pid)
-      return text ? `[${a.app}]\n${text}` : ''
+      return { app: a.app, text }
     })
   )
 
-  return results.filter(Boolean).join('\n\n')
+  const unreadableApps = results.filter((r) => !r.text).map((r) => r.app)
+  const text = results
+    .filter((r) => r.text)
+    .map((r) => `[${r.app}]\n${r.text}`)
+    .join('\n\n')
+
+  return { text, unreadableApps }
 }
 
 // ── Window ────────────────────────────────────────────────────────────────────
@@ -368,6 +495,17 @@ app.on('window-all-closed', () => {
 
 ipcMain.on('app:quit', () => app.exit(0))
 
+ipcMain.handle('accessibility:check', () => {
+  return systemPreferences.isTrustedAccessibilityClient(false)
+})
+
+ipcMain.handle('drafts:get', () => loadDrafts())
+ipcMain.on('drafts:clear', () => clearDrafts())
+
+ipcMain.on('accessibility:openSettings', () => {
+  shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility')
+})
+
 ipcMain.on('window:setHeight', (_event, height: number) => {
   win?.setSize(300, Math.ceil(height), false)
 })
@@ -407,13 +545,10 @@ ipcMain.handle('notion:write', async (_event, { pageId, draft }: { pageId: strin
   }
 })
 
-// Start scheduler on app ready if whitelist already set
+// Reset session state on every app start — apps and cards are selected fresh each session
 app.whenReady().then(() => {
   const settings = loadSettings()
-  if (settings.whitelistedApps.length > 0) {
-    const ms = FREQUENCY_MS[settings.frequency] ?? FREQUENCY_MS['End of day']
-    startScheduler(ms)
-  }
+  persistSettings({ ...settings, whitelistedApps: [], activeCards: [] })
 })
 
 // Returns list of currently running apps for whitelist selection
@@ -439,19 +574,95 @@ ipcMain.handle('apps:setWhitelist', async (_event, apps: string[]) => {
   return { status: 'ok' }
 })
 
+// Fetches pages from the user's Notion database
+ipcMain.handle('notion:getCards', async () => {
+  const settings = loadSettings()
+  if (!settings.notionToken) return []
+  try {
+    let databaseId = settings.selectedBoard
+    if (!databaseId) {
+      const searchRes = await fetch('https://api.notion.com/v1/search', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${settings.notionToken}`,
+          'Notion-Version': '2022-06-28',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ filter: { property: 'object', value: 'database' } }),
+      })
+      const searchData = (await searchRes.json()) as { results: Array<{ id: string }> }
+      if (searchData.results.length === 0) return []
+      databaseId = searchData.results[0].id
+      persistSettings({ ...settings, selectedBoard: databaseId })
+    }
+
+    const queryRes = await fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${settings.notionToken}`,
+        'Notion-Version': '2022-06-28',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ page_size: 50 }),
+    })
+    type NotionPage = {
+      id: string
+      properties: Record<string, { type: string; title?: Array<{ plain_text: string }> }>
+    }
+    const queryData = (await queryRes.json()) as { results: NotionPage[] }
+    return queryData.results.map((page) => {
+      const titleProp = Object.values(page.properties).find((p) => p.type === 'title')
+      const title = titleProp?.title?.map((t) => t.plain_text).join('') ?? 'Untitled'
+      return { id: page.id, title }
+    })
+  } catch (e) {
+    console.error('notion:getCards failed:', e)
+    return []
+  }
+})
+
+// Returns all Notion databases the token has access to
+ipcMain.handle('notion:getDatabases', async () => {
+  const settings = loadSettings()
+  if (!settings.notionToken) return []
+  try {
+    const res = await fetch('https://api.notion.com/v1/search', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${settings.notionToken}`,
+        'Notion-Version': '2022-06-28',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ filter: { property: 'object', value: 'database' } }),
+    })
+    type NotionDB = { id: string; title: Array<{ plain_text: string }> }
+    const data = (await res.json()) as { results: NotionDB[] }
+    return data.results.map((db) => ({
+      id: db.id,
+      title: db.title?.map((t) => t.plain_text).join('') || 'Untitled',
+    }))
+  } catch (e) {
+    console.error('notion:getDatabases failed:', e)
+    return []
+  }
+})
+
 // Reads all whitelisted apps → generates AI draft
 ipcMain.handle('snapshot:trigger', async () => {
   const settings = loadSettings()
-  if (settings.whitelistedApps.length === 0) {
-    return { status: 'no_apps_selected' }
-  }
+  if (settings.whitelistedApps.length === 0) return { status: 'no_apps_selected' }
+  if (settings.activeCards.length === 0) return { status: 'no_cards_selected' }
   try {
-    const text = await readWhitelistedApps(settings.whitelistedApps)
-    if (!text) return { status: 'empty' }
+    const { text, unreadableApps } = await readWhitelistedApps(settings.whitelistedApps)
+    if (!text) return { status: 'empty', unreadableApps }
     const previous = loadLastSnapshot()
-    const draft = await generateDraft(text, previous, settings.anthropicKey)
+    const formatSample = settings.notionToken && settings.selectedBoard
+      ? await fetchFormatSample(settings.notionToken, settings.selectedBoard)
+      : ''
+    const drafts = await generateDrafts(text, previous, settings.activeCards, formatSample, settings.anthropicKey)
     saveSnapshot(text)
-    return { status: 'ok', draft }
+    saveDrafts(drafts)
+    return { status: 'ok', drafts, unreadableApps }
   } catch (e) {
     console.error('snapshot failed:', e)
     return { status: 'error' }
