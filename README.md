@@ -70,23 +70,3 @@ npm run dev
 ```bash
 npm run build:mac:dev
 ```
-
-**Signed + notarized DMG** (requires Apple Developer account):
-```bash
-# Add to .env:
-# APPLE_TEAM_ID=your 10-char team ID (developer.apple.com → Membership)
-# APPLE_ID=your Apple ID email
-# APPLE_APP_SPECIFIC_PASSWORD=generated at appleid.apple.com
-
-npm run build:mac:dist
-```
-
-Output: `dist/Relay-x.x.x.dmg`
-
----
-
-## Roadmap
-
-- [ ] App distribution (code signing, notarization, public DMG)
-- [ ] Multi-board support
-- [ ] Phase 2: Java/Spring backend for subscription model and hosted AI calls
