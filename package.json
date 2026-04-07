@@ -9,7 +9,8 @@
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "build:mac:dev": "npm run build && electron-builder --mac --config.mac.identity=null",
-    "build:mac:dist": "npm run build && electron-builder --mac"
+    "build:mac:dist": "npm run build && electron-builder --mac",
+    "checksum": "bash scripts/checksum.sh"
   },
   "dependencies": {
     "@electron-toolkit/utils": "^3.0.0"

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Tray, nativeImage, ipcMain, screen, shell, Notification, systemPreferences } from 'electron'
+import { app, BrowserWindow, Tray, nativeImage, ipcMain, screen, shell, Notification, systemPreferences, safeStorage } from 'electron'
 import { join } from 'path'
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from 'fs'
 import { createServer } from 'http'
@@ -39,10 +39,38 @@ const DEFAULT_SETTINGS = {
 
 type Settings = typeof DEFAULT_SETTINGS
 
+// Sensitive fields encrypted at rest via macOS Keychain (safeStorage).
+// Stored on disk as "enc:<base64>". Plain values are migrated on first read.
+const ENC_PREFIX = 'enc:'
+
+function encrypt(value: string): string {
+  if (!safeStorage.isEncryptionAvailable()) return value
+  return ENC_PREFIX + safeStorage.encryptString(value).toString('base64')
+}
+
+function decrypt(value: string): string {
+  if (!value.startsWith(ENC_PREFIX)) return value  // plaintext — migrate on next save
+  if (!safeStorage.isEncryptionAvailable()) return value
+  try {
+    return safeStorage.decryptString(Buffer.from(value.slice(ENC_PREFIX.length), 'base64'))
+  } catch {
+    return ''
+  }
+}
+
 function loadSettings(): Settings {
   try {
     if (existsSync(SETTINGS_PATH)) {
-      return { ...DEFAULT_SETTINGS, ...JSON.parse(readFileSync(SETTINGS_PATH, 'utf-8')) }
+      const raw = JSON.parse(readFileSync(SETTINGS_PATH, 'utf-8')) as Partial<Settings> & {
+        notionToken?: string | null
+        anthropicKey?: string
+      }
+      return {
+        ...DEFAULT_SETTINGS,
+        ...raw,
+        notionToken: raw.notionToken ? decrypt(raw.notionToken) : null,
+        anthropicKey: raw.anthropicKey ? decrypt(raw.anthropicKey) : DEFAULT_SETTINGS.anthropicKey,
+      }
     }
   } catch {
     // ignore parse errors, fall back to defaults
@@ -54,7 +82,12 @@ function persistSettings(settings: Settings): void {
   try {
     const dir = app.getPath('userData')
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-    writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2))
+    const toWrite = {
+      ...settings,
+      notionToken: settings.notionToken ? encrypt(settings.notionToken) : null,
+      anthropicKey: settings.anthropicKey ? encrypt(settings.anthropicKey) : '',
+    }
+    writeFileSync(SETTINGS_PATH, JSON.stringify(toWrite, null, 2))
   } catch (e) {
     console.error('Failed to save settings:', e)
   }
@@ -512,11 +545,19 @@ ipcMain.on('window:setHeight', (_event, height: number) => {
 
 ipcMain.handle('settings:get', () => loadSettings())
 
-ipcMain.handle('settings:save', (_event, settings: Settings) => {
-  persistSettings(settings)
+ipcMain.handle('settings:save', (_event, patch: Partial<Settings>) => {
+  // Never allow renderer to overwrite sensitive keys — always preserve from disk
+  const current = loadSettings()
+  const merged: Settings = {
+    ...current,
+    ...patch,
+    notionToken: current.notionToken,
+    anthropicKey: current.anthropicKey,
+  }
+  persistSettings(merged)
   // Restart scheduler if frequency changed and whitelist is set
-  if (settings.whitelistedApps.length > 0) {
-    const ms = FREQUENCY_MS[settings.frequency] ?? FREQUENCY_MS['End of day']
+  if (merged.whitelistedApps.length > 0) {
+    const ms = FREQUENCY_MS[merged.frequency] ?? FREQUENCY_MS['End of day']
     startScheduler(ms)
   }
   return { success: true }

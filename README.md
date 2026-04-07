@@ -70,3 +70,14 @@ npm run dev
 ```bash
 npm run build:mac:dev
 ```
+
+**Signed + notarized DMG** (requires Apple Developer account):
+```bash
+npm run build:mac:dist
+```
+
+**Verify a release download:**
+```bash
+shasum -a 256 Relay-x.x.x.dmg
+```
+Compare the output against the SHA256 checksum listed on the [Releases](https://github.com/yoonhj7173/relay/releases) page.
